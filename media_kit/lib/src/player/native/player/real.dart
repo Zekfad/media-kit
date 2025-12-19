@@ -3,16 +3,17 @@
 /// Copyright © 2021 & onwards, Hitesh Kumar Saini <saini123hitesh@gmail.com>.
 /// All rights reserved.
 /// Use of this source code is governed by MIT license that can be found in the LICENSE file.
-import 'dart:io';
-import 'dart:ffi';
 import 'dart:async';
 import 'dart:collection';
+import 'dart:ffi';
+import 'dart:io';
 import 'dart:typed_data';
-import 'package:path/path.dart';
-import 'package:meta/meta.dart';
 import 'package:image/image.dart';
-import 'package:synchronized/synchronized.dart';
+import 'package:meta/meta.dart';
+import 'package:path/path.dart';
 import 'package:safe_local_storage/safe_local_storage.dart';
+import 'package:synchronized/synchronized.dart';
+import 'package:uri_parser/uri_parser.dart';
 
 import 'package:media_kit/ffi/ffi.dart';
 
@@ -100,11 +101,36 @@ class NativePlayer extends PlatformPlayer {
 
       await super.dispose();
 
+      // Clear the wakeup callback before destroying
       Initializer(mpv).dispose(ctx);
 
-      Future.delayed(const Duration(seconds: 5), () {
-        mpv.mpv_terminate_destroy(ctx);
-      });
+      // Send quit command and wait for MPV_EVENT_SHUTDOWN before destroying
+      // This ensures all mpv threads and callbacks have been properly cleaned up
+      try {
+        _shutdownCompleter = Completer<void>();
+
+        final cmd = 'quit'.toNativeUtf8();
+        try {
+          mpv.mpv_command_string(ctx, cmd.cast());
+        } finally {
+          calloc.free(cmd);
+        }
+
+        // Wait for shutdown event with timeout to prevent hanging
+        await _shutdownCompleter!.future.timeout(
+          const Duration(seconds: 3),
+          onTimeout: () {
+            print('media_kit: Warning - Shutdown event timeout, proceeding with forced termination');
+          },
+        );
+      } catch (e) {
+        print('media_kit: Error during graceful shutdown: $e');
+      } finally {
+        _shutdownCompleter = null;
+      }
+
+      // Now it's safe to terminate and destroy the mpv context
+      mpv.mpv_terminate_destroy(ctx);
     }
 
     if (synchronized) {
@@ -185,7 +211,7 @@ class NativePlayer extends PlatformPlayer {
           await _command(
             [
               'loadfile',
-              playlist[i].uri,
+              _sanitizeUri(playlist[i].uri),
               'append',
             ],
           );
@@ -194,7 +220,7 @@ class NativePlayer extends PlatformPlayer {
         final file = await TempFile.create();
         final buffer = StringBuffer();
         for (final media in playlist) {
-          buffer.writeln(media.uri);
+          buffer.writeln(_sanitizeUri(media.uri));
         }
         final list = buffer.toString();
 
@@ -473,7 +499,7 @@ class NativePlayer extends PlatformPlayer {
       }
       // ---------------------------------------------
 
-      await _command(['loadfile', media.uri, 'append']);
+      await _command(['loadfile', _sanitizeUri(media.uri), 'append']);
     }
 
     if (synchronized) {
@@ -1372,6 +1398,14 @@ class NativePlayer extends PlatformPlayer {
   }
 
   Future<void> _handler(Pointer<generated.mpv_event> event) async {
+    // Handle shutdown event to signal safe disposal
+    if (event.ref.event_id == generated.mpv_event_id.MPV_EVENT_SHUTDOWN) {
+      if (_shutdownCompleter != null && !_shutdownCompleter!.isCompleted) {
+        _shutdownCompleter!.complete();
+      }
+      return;
+    }
+
     if (event.ref.event_id ==
         generated.mpv_event_id.MPV_EVENT_PROPERTY_CHANGE) {
       final prop = event.ref.data.cast<generated.mpv_event_property>();
@@ -2534,6 +2568,7 @@ class NativePlayer extends PlatformPlayer {
   int _asyncRequestNumber = 0;
   final Map<int, Completer<int>> _setPropertyRequests = {};
   final Map<int, Completer<int>> _commandRequests = {};
+  Completer<void>? _shutdownCompleter;
 
   Future<void> _setProperty(String name, int format, Pointer<Void> data) async {
     final requestNumber = _asyncRequestNumber++;
@@ -2633,6 +2668,21 @@ class NativePlayer extends PlatformPlayer {
 
     calloc.free(arr);
     pointers.forEach(calloc.free);
+  }
+
+  String _sanitizeUri(String uri) {
+    // Append \\?\ prefix on Windows to support long file paths.
+    final parser = URIParser(uri);
+    switch (parser.type) {
+      case URIType.file:
+        return addPrefix(parser.file!.path);
+      case URIType.directory:
+        return addPrefix(parser.directory!.path);
+      case URIType.network:
+        return parser.uri!.toString();
+      default:
+        return uri;
+    }
   }
 
   /// Generated libmpv C API bindings.
@@ -2892,7 +2942,7 @@ _GetPlaylistResult _getPlaylist(_GetPlaylistData data) {
         if (map.values[j].format == generated.mpv_format.MPV_FORMAT_STRING) {
           if (property == 'filename') {
             final value = map.values[j].u.string.cast<Utf8>().toDartString();
-            playlist.add(value);
+            playlist.add(removePrefix(value));
           }
         }
       }
